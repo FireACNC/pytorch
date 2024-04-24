@@ -16,6 +16,7 @@ import torch.ao.quantization.fx._decomposed
 import torch.fx
 import torch.utils._pytree as pytree
 from torch._dynamo.create_parameter_op import _bind_nn_parameter
+from torch._higher_order_ops.associative_scan import associative_scan_op
 from torch._higher_order_ops.triton_kernel_wrap import (
     triton_kernel_wrapper_functional,
     triton_kernel_wrapper_mutation,
@@ -58,9 +59,10 @@ from .utils import (
     is_dynamic,
     is_gpu,
     is_pointwise_use,
+    needs_fallback_due_to_atomic_add_limitations,
     pad_listlike,
-    parallel_num_threads,
     sympy_product,
+    use_scatter_fallback,
 )
 from .virtualized import ops, V
 
@@ -88,8 +90,9 @@ def add_needs_realized_inputs(fn):
         return [add_needs_realized_inputs(x) for x in fn]
     needs_realized_inputs.add(fn)
     if isinstance(fn, torch._ops.OpOverloadPacket):
-        for overload in fn.overloads():
-            needs_realized_inputs.add(getattr(fn, overload))
+        needs_realized_inputs.update(
+            getattr(fn, overload) for overload in fn.overloads()
+        )
 
 
 def add_layout_constraint(fn, constraint):
@@ -207,7 +210,8 @@ def transform_args(args, broadcast, type_promotion_kind, convert_input_to_bool):
             promoting_args = [
                 a
                 for a in args
-                if isinstance(a, (Number, sympy.Expr)) or hasattr(a, "dtype")
+                if isinstance(a, (Number, sympy.Expr))
+                or getattr(a, "dtype", None) is not None
             ]
             dtype = get_promoted_dtype(
                 *promoting_args, type_promotion_kind=type_promotion_kind
@@ -1419,363 +1423,6 @@ def glu(x, dim=-1):
     return mul(a, sigmoid(b))
 
 
-def register_onednn_fusion_ops():
-    if torch._C._has_mkldnn:
-        cpu_needs_realized_inputs = [
-            torch.ops.mkldnn._convolution_pointwise,
-            torch.ops.mkldnn._convolution_pointwise_,
-            torch.ops.mkldnn._convolution_transpose_pointwise,
-            torch.ops.mkldnn._linear_pointwise,
-            aten.mkldnn_rnn_layer.default,
-            torch.ops.onednn.qconv2d_pointwise,
-        ]
-
-        @register_lowering(torch.ops.mkldnn._convolution_pointwise)
-        def convolution_unary(
-            x: TensorBox,
-            weight: TensorBox,
-            bias: TensorBox,
-            padding,
-            stride,
-            dilation,
-            groups,
-            attr,
-            scalars,
-            algorithm,
-        ):
-            return TensorBox.create(
-                ir.ConvolutionUnary.create(
-                    x,
-                    weight,
-                    bias,
-                    padding,
-                    stride,
-                    dilation,
-                    groups,
-                    attr,
-                    scalars,
-                    algorithm,
-                )
-            )
-
-        @register_lowering(torch.ops.mkldnn._convolution_pointwise.binary)
-        def convolution_binary(
-            x: TensorBox,
-            other: TensorBox,
-            weight: TensorBox,
-            bias: TensorBox,
-            padding,
-            stride,
-            dilation,
-            groups,
-            binary_attr,
-            binary_alpha,
-            unary_attr,
-            unary_scalars,
-            unary_algorithm,
-        ):
-            return TensorBox.create(
-                ir.ConvolutionBinary.create(
-                    x,
-                    other,
-                    weight,
-                    bias,
-                    padding,
-                    stride,
-                    dilation,
-                    groups,
-                    binary_attr,
-                    binary_alpha,
-                    unary_attr,
-                    unary_scalars,
-                    unary_algorithm,
-                )
-            )
-
-        @register_lowering(torch.ops.mkldnn._convolution_pointwise_.binary)
-        def convolution_binary_inplace(
-            x: TensorBox,
-            other: TensorBox,
-            weight: TensorBox,
-            bias: TensorBox,
-            padding,
-            stride,
-            dilation,
-            groups,
-            binary_attr,
-            binary_alpha,
-            unary_attr,
-            unary_scalars,
-            unary_algorithm,
-        ):
-            return TensorBox.create(
-                ir.ConvolutionBinaryInplace.create(
-                    x,
-                    other,
-                    weight,
-                    bias,
-                    padding,
-                    stride,
-                    dilation,
-                    groups,
-                    binary_attr,
-                    binary_alpha,
-                    unary_attr,
-                    unary_scalars,
-                    unary_algorithm,
-                )
-            )
-
-        @register_lowering(torch.ops.mkldnn._linear_pointwise)
-        def linear_unary(
-            x: TensorBox, w: TensorBox, b: TensorBox, attr, scalars, algorithm
-        ):
-            return TensorBox.create(
-                ir.LinearUnary.create(x, w, b, attr, scalars, algorithm)
-            )
-
-        @register_lowering(torch.ops.mkldnn._linear_pointwise.binary)
-        def linear_binary(x: TensorBox, y: TensorBox, w: TensorBox, b: TensorBox, attr):
-            return TensorBox.create(ir.LinearBinary.create(x, y, w, b, attr))
-
-        @register_lowering(torch.ops.mkldnn._convolution_transpose_pointwise)
-        def convolution_transpose_unary(
-            x: TensorBox,
-            weight: TensorBox,
-            bias: TensorBox,
-            padding,
-            output_padding,
-            stride,
-            dilation,
-            groups,
-            attr,
-            scalars,
-            algorithm,
-        ):
-            return TensorBox.create(
-                ir.ConvolutionTransposeUnary.create(
-                    x,
-                    weight,
-                    bias,
-                    padding,
-                    output_padding,
-                    stride,
-                    dilation,
-                    groups,
-                    attr,
-                    scalars,
-                    algorithm,
-                )
-            )
-
-        @register_lowering(aten.mkldnn_rnn_layer.default)
-        def mkldnn_rnn_layer(
-            x: TensorBox,
-            w0: TensorBox,
-            w1: TensorBox,
-            w2: TensorBox,
-            w3: TensorBox,
-            hx: TensorBox,
-            cx: TensorBox,
-            reverse: bool,
-            batch_sizes: List[int],
-            mode: int,
-            hidden_size: int,
-            num_layers: int,
-            has_biases: bool,
-            bidirectional: bool,
-            batch_first: bool,
-            train: bool,
-        ):
-            return pytree.tree_map(
-                TensorBox.create,
-                ir.MkldnnRnnLayer.create(
-                    x,
-                    w0,
-                    w1,
-                    w2,
-                    w3,
-                    hx,
-                    cx,
-                    reverse,
-                    batch_sizes,
-                    mode,
-                    hidden_size,
-                    num_layers,
-                    has_biases,
-                    bidirectional,
-                    batch_first,
-                    train,
-                ),
-            )
-
-        @register_lowering(torch.ops.onednn.qconv2d_pointwise, type_promotion_kind=None)
-        def qconvolution_unary(
-            x: TensorBox,
-            x_scale,
-            x_zp,
-            packed_weight: TensorBox,
-            w_scale: TensorBox,
-            w_zp: TensorBox,
-            bias: TensorBox,
-            stride,
-            padding,
-            dilation,
-            groups,
-            o_inv_scale,
-            o_zero_point,
-            output_dtype,
-            attr,
-            scalars,
-            algorithm,
-        ):
-            return TensorBox.create(
-                ir.QConvPointWisePT2E.create(
-                    x,
-                    x_scale,
-                    x_zp,
-                    packed_weight,
-                    w_scale,
-                    w_zp,
-                    bias,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                    o_inv_scale,
-                    o_zero_point,
-                    output_dtype,
-                    attr,
-                    scalars,
-                    algorithm,
-                )
-            )
-
-        @register_lowering(
-            torch.ops.onednn.qconv2d_pointwise.binary, type_promotion_kind=None
-        )
-        def qconvolution_binary(
-            x: TensorBox,
-            x_scale,
-            x_zp,
-            accum: TensorBox,
-            accum_scale,
-            accum_zp,
-            packed_weight: TensorBox,
-            w_scale: TensorBox,
-            w_zp: TensorBox,
-            bias: TensorBox,
-            stride,
-            padding,
-            dilation,
-            groups,
-            o_inv_scale,
-            o_zero_point,
-            output_dtype,
-            binary_attr,
-            alpha,
-            unary_attr,
-            unary_scalars,
-            unary_algorithmm,
-        ):
-            if (
-                binary_attr == "sum"
-                and output_dtype in [torch.float32, torch.bfloat16]
-                and accum.get_dtype() in [torch.float32, torch.bfloat16]
-                and accum.get_dtype() != output_dtype
-            ):
-                # For int8-mixed-bf16 quantization and inplace add,
-                # there is case when accum dtype is float32 but output dtype is bfloat16.
-                # Since the accum will be inplaced changed with post op sum,
-                # we will do accum dtype convertion here.
-                accum = to_dtype(accum, output_dtype)
-            return TensorBox.create(
-                ir.QConvPointWiseBinaryPT2E.create(
-                    x,
-                    x_scale,
-                    x_zp,
-                    accum,
-                    accum_scale,
-                    accum_zp,
-                    packed_weight,
-                    w_scale,
-                    w_zp,
-                    bias,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                    o_inv_scale,
-                    o_zero_point,
-                    output_dtype,
-                    binary_attr,
-                    alpha,
-                    unary_attr,
-                    unary_scalars,
-                    unary_algorithmm,
-                )
-            )
-
-        @register_lowering(torch.ops.onednn.qlinear_pointwise, type_promotion_kind=None)
-        def qlinear_unary(
-            x: TensorBox,
-            x_scale,
-            x_zp,
-            packed_weight: TensorBox,
-            w_scale: TensorBox,
-            w_zp: TensorBox,
-            bias: TensorBox,
-            o_inv_scale,
-            o_zero_point,
-            output_dtype,
-            attr,
-            scalars,
-            algorithm,
-        ):
-            return TensorBox.create(
-                ir.QLinearPointwisePT2E.create(
-                    x,
-                    x_scale,
-                    x_zp,
-                    packed_weight,
-                    w_scale,
-                    w_zp,
-                    bias,
-                    o_inv_scale,
-                    o_zero_point,
-                    output_dtype,
-                    attr,
-                    scalars,
-                    algorithm,
-                )
-            )
-
-        if torch._C.has_mkl:
-            cpu_needs_realized_inputs.append(torch.ops.mkl._mkl_linear)
-
-            @register_lowering(torch.ops.mkl._mkl_linear)
-            def mkl_packed_linear(
-                x: TensorBox,
-                packed_w: TensorBox,
-                orig_w: TensorBox,
-                b: TensorBox,
-                batch_size,
-            ):
-                result = TensorBox.create(
-                    ir.MKLPackedLinear.create(x, packed_w, orig_w, batch_size)
-                )
-                if b is not None:
-                    result = add(result, b)
-                return result
-
-        add_needs_realized_inputs(cpu_needs_realized_inputs)
-    else:
-        pass
-
-
-register_onednn_fusion_ops()
-
-
 def fallback_handler(kernel, add_to_fallback_set=True):
     if add_to_fallback_set:
         fallbacks.add(kernel)
@@ -1985,7 +1632,7 @@ def bernoulli_p(x, *args):
 # This shouldn't be called in general
 @register_lowering(aten._foobar)
 def _foobar(_):
-    raise AssertionError()
+    raise AssertionError
 
 
 @functools.lru_cache(1)
@@ -2260,7 +1907,6 @@ def sdpa_constraint(fx_node, *args, **kwargs):
 
 
 # WIP
-make_fallback(aten.index_reduce)  # @pearu
 make_fallback(aten._adaptive_avg_pool3d)  # @isuruf
 make_fallback(aten.adaptive_max_pool3d)  # @isuruf
 make_fallback(aten.fractional_max_pool3d)  # @isuruf
@@ -2443,6 +2089,9 @@ make_fallback(aten._flash_attention_backward.default, sdpa_constraint)
 make_fallback(aten._efficient_attention_forward.default, sdpa_constraint)
 make_fallback(aten._efficient_attention_backward.default, sdpa_constraint)
 make_fallback(aten._scaled_mm.default, constrain_to_fx_strides)
+
+# index_reduce requires fallback when use_scatter_fallback(...) returns True
+make_fallback(aten.index_reduce)
 
 
 # Register with type_promotion_kind None.
@@ -3175,11 +2824,6 @@ def _unsafe_index_put_(self, indices, values, accumulate=False):
     return index_put_impl_(self, indices, values, accumulate, check=False)
 
 
-def needs_fallback_due_to_atomic_add_limitations(dtype):
-    # tl.atomic_add does NOT support the following types
-    return dtype in {torch.int64, torch.bool, torch.bfloat16}
-
-
 def index_put_impl_(self, indices, values, accumulate, check):
     # Dispatch to masked fill for single boolean index with single value
     if (
@@ -3320,7 +2964,7 @@ def scatter(x, dim: int, index, src, **kwargs):
 
 
 def scatter_fallback(
-    fn,
+    op_overload: torch._ops.OpOverload,
     self,
     dim: int,
     index,
@@ -3329,28 +2973,17 @@ def scatter_fallback(
     reduce: Optional[str] = None,
     include_self: bool = True,
 ):
-    reduce_ty = "add" if fn == "aten.scatter_" else "sum"
-    if (
-        reduce not in {None, reduce_ty}
-        or (
-            isinstance(src, TensorBox)
-            and is_gpu(src.get_device().type)
-            and needs_fallback_due_to_atomic_add_limitations(src.get_dtype())
-        )
-        or (
-            fn == "aten.scatter_reduce_"
-            and reduce == "sum"
-            and isinstance(src, TensorBox)
-            and src.get_device() == torch.device("cpu")
-            and config.cpp.fallback_scatter_reduce_sum
-            and (config.cpp.dynamic_threads or parallel_num_threads() != 1)
-        )
-        or (reduce == reduce_ty and self.get_dtype() in {torch.bool, torch.int64})
-        or torch.are_deterministic_algorithms_enabled()
+    src_is_tensor = isinstance(src, TensorBox)
+    if use_scatter_fallback(
+        op_overload,
+        reduce,
+        self.get_dtype(),
+        src.get_dtype() if src_is_tensor else type(src),
+        src.get_device().type if src_is_tensor else "not impl",
+        src_is_tensor,
     ):
         ir.ScatterFallback(
-            V.graph.current_node.target,
-            fn,
+            op_overload,
             self,
             dim,
             index,
@@ -3367,18 +3000,18 @@ def scatter_fallback(
 def scatter_(self, dim: int, index, src, *, reduce: Optional[str] = None):
     assert reduce in {None, "add", "multiply"}
 
-    fallback_result = scatter_fallback(
-        "aten.scatter_", self, dim, index, src, reduce=reduce
-    )
-
-    if fallback_result:
-        return fallback_result
+    if reduce is None:
+        op_overload = getattr(aten.scatter_, V.graph.current_node.target._overloadname)  # type: ignore[union-attr]
+        fallback_result = scatter_fallback(
+            op_overload, self, dim, index, src, reduce=reduce
+        )
+        if fallback_result is not None:
+            return fallback_result
 
     if reduce == "add":
         reduce = "sum"
     elif reduce == "multiply":
         reduce = "prod"
-
     return scatter_reduce_(self, dim, index, src, reduce)
 
 
@@ -3401,8 +3034,12 @@ def scatter_reduce(x, dim: int, index, src, reduction_type, **kwargs):
 def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = True):
     assert reduce in {None, "sum", "prod", "mean", "amax", "amin"}
 
+    assert (
+        len(aten.scatter_reduce_.overloads()) == 1
+        and "two" in aten.scatter_reduce_.overloads()
+    ), "aten.scatter_reduce_.two is not the unique overload of aten.scatter_reduce_"
     fallback_result = scatter_fallback(
-        "aten.scatter_reduce_",
+        aten.scatter_reduce_.two,
         self,
         dim,
         index,
@@ -3998,16 +3635,12 @@ def max_pool2d_with_indices_backward(
     new_size = list(x.get_size())
 
     h_window_size = max(
-        [
-            max(h // stride[0] - max(0, (h - kernel_size[0]) // stride[0]), 1)
-            for h in range(kernel_size[0] * 2)
-        ]
+        max(h // stride[0] - max(0, (h - kernel_size[0]) // stride[0]), 1)
+        for h in range(kernel_size[0] * 2)
     )
     w_window_size = max(
-        [
-            max(w // stride[1] - max(0, (w - kernel_size[1]) // stride[1]), 1)
-            for w in range(kernel_size[1] * 2)
-        ]
+        max(w // stride[1] - max(0, (w - kernel_size[1]) // stride[1]), 1)
+        for w in range(kernel_size[1] * 2)
     )
 
     window_size = h_window_size * w_window_size
@@ -4709,16 +4342,12 @@ def avg_pool2d_backward(
     dtype = x.get_dtype()
 
     h_window_size = max(
-        [
-            max(h // stride[0] - max(0, (h - kernel_size[0]) // stride[0]), 1)
-            for h in range(kernel_size[0] * 2)
-        ]
+        max(h // stride[0] - max(0, (h - kernel_size[0]) // stride[0]), 1)
+        for h in range(kernel_size[0] * 2)
     )
     w_window_size = max(
-        [
-            max(w // stride[1] - max(0, (w - kernel_size[1]) // stride[1]), 1)
-            for w in range(kernel_size[1] * 2)
-        ]
+        max(w // stride[1] - max(0, (w - kernel_size[1]) // stride[1]), 1)
+        for w in range(kernel_size[1] * 2)
     )
 
     window_size = h_window_size * w_window_size
@@ -6093,21 +5722,76 @@ def templated_attention(*args, **kwargs):
             choices: List[Any] = []
             from .select_algorithm import autotune_select_algorithm
 
-            sdpa_template.maybe_append_choice(
-                choices=choices,
-                input_nodes=(query, key, value),
-                layout=layout,
-                subgraphs=subgraph_buffer,
-                num_stages=2,
-                num_warps=4,
-                BLOCK_M=64,
-                BLOCK_N=128,
-                BLOCK_DMODEL=query.get_size()[-1],
-            )
+            for BLOCK_M, BLOCK_N, num_warps, num_stages in [
+                (128, 64, 4, 3),
+                (128, 128, 4, 3),
+                (128, 128, 8, 2),
+                (64, 128, 4, 3),
+            ]:
+                sdpa_template.maybe_append_choice(
+                    choices=choices,
+                    input_nodes=(query, key, value),
+                    layout=layout,
+                    subgraphs=subgraph_buffer,
+                    num_stages=num_stages,
+                    num_warps=num_warps,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    BLOCK_DMODEL=query.get_size()[-1],
+                )
             return autotune_select_algorithm(
                 "sdpa", choices, [query, key, value], layout
             )
     raise ValueError("TemplatedAttention was passed a subgraph with no output node!")
+
+
+@register_lowering(associative_scan_op, type_promotion_kind=None)
+def associative_scan(combine_fn: ir.Subgraph, input, dim: int):
+    from .subgraph_lowering import InputDescriptor, lower_pointwise_subgraph
+
+    subgraph_inputs = [
+        InputDescriptor(dtype=input.get_dtype(), device=input.get_device())
+        for _ in range(2)
+    ]
+    lowered_combine_fn = lower_pointwise_subgraph(combine_fn, subgraph_inputs)
+
+    def wrapped_combine_fn(lhs, rhs):
+        res = lowered_combine_fn(
+            *pytree.tree_leaves(lhs),
+            *pytree.tree_leaves(rhs),
+        )
+        return (res,)
+
+    kwargs = _make_scan_inner(input, axis=dim, dtype=None)
+    result = ir.Scan.create(**kwargs, combine_fn=wrapped_combine_fn)
+    if result is None:
+        raise RuntimeError("Unable to generate code for associative_scan op")
+    return result[0]
+
+
+@register_lowering(torch.ops.prims._sink_tokens.default)
+def _sink_tokens(tokens):
+    return None
+
+
+@register_lowering(torch.ops.higher_order.with_effects)
+def with_effects(token, op, *args, **kwargs):
+    result = ir.EffectfulKernel.create(op, *args, **kwargs)
+
+    from torch._higher_order_ops.effects import get_effect_key
+
+    effect_type = get_effect_key(op, args, kwargs)
+    assert effect_type is not None
+    effectful_kernel = V.graph.effectful_ops[effect_type]
+
+    if result is None:
+        return (effectful_kernel,)
+
+    result = pytree.tree_map_only(ir.MultiOutput, TensorBox.create, result)
+    if not isinstance(result, (list, tuple)):
+        return (effectful_kernel, result)
+    else:
+        return (effectful_kernel, *result)
 
 
 try:
@@ -6299,3 +5983,7 @@ from . import quantized_lowerings
 
 quantized_lowerings.register_quantized_ops()
 quantized_lowerings.register_woq_mm_ops()
+
+from . import mkldnn_lowerings
+
+mkldnn_lowerings.register_onednn_fusion_ops()
